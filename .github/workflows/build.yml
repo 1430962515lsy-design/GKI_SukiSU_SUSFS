@@ -1,0 +1,437 @@
+name: Custom Kernel Build - Core
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_call:
+    inputs:
+      android_version:
+        required: true
+        type: string
+      kernel_version:
+        required: true
+        type: string
+      sub_level:
+        required: true
+        type: string
+      os_patch_level:
+        required: true
+        type: string
+      revision:
+        required: false
+        type: string
+      ksu_variant:
+        required: true
+        type: string
+      ksu_branch:
+        required: true
+        type: string
+      sukisu_commit:
+        required: false
+        type: string
+      susfs_commit:
+        required: false
+        type: string
+      version:
+        required: false
+        type: string
+      build_time:
+        required: false
+        type: string
+      enable_susfs:
+        required: true
+        type: boolean
+      enable_susfs_log:
+        required: true
+        type: boolean
+      enable_kpm:
+        required: true
+        type: boolean
+
+jobs:
+  build-kernel:
+    name: "Compile: ${{ inputs.kernel_version }}.${{ inputs.sub_level }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      SUKISU_COMMIT: ${{ inputs.sukisu_commit }}
+      SUSFS_COMMIT: ${{ inputs.susfs_commit }}
+      KBUILD_BUILD_USER: "build-user"
+      KBUILD_BUILD_HOST: "build-host"
+
+    steps:
+      # ==========================================
+      # 1. Environment & tool setup
+      # ==========================================
+      - name: Free disk space
+        uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules"
+          rm_cmd: "rmz"
+          rmz_version: "3.1.1"
+          testing: false
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Initialize build environment
+        run: |
+          CONFIG="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}"
+          KERNEL_ROOT="$GITHUB_WORKSPACE/$CONFIG"
+          mkdir -p "$KERNEL_ROOT"
+
+          cat >> $GITHUB_ENV << EOF
+          CONFIG=$CONFIG
+          KERNEL_ROOT=$KERNEL_ROOT
+          DEFCONFIG=$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig
+          SUSFS4KSU=$GITHUB_WORKSPACE/susfs4ksu
+          KERNEL_PATCHES=$GITHUB_WORKSPACE/kernel_patches
+          SUKISU_PATCHES=$GITHUB_WORKSPACE/SukiSU_patch
+          ANYKERNEL3=$GITHUB_WORKSPACE/AnyKernel3
+          AVBTOOL=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin/avbtool
+          MKBOOTIMG=$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py
+          UNPACK_BOOTIMG=$GITHUB_WORKSPACE/mkbootimg/unpack_bootimg.py
+          BOOT_SIGN_KEY_PATH=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem
+          EOF
+
+          mkdir -p "$GITHUB_WORKSPACE/git-repo"
+          curl -LSs https://storage.googleapis.com/git-repo-downloads/repo -o "$GITHUB_WORKSPACE/git-repo/repo"
+          chmod 0755 "$GITHUB_WORKSPACE/git-repo/repo"
+          echo "$GITHUB_WORKSPACE/git-repo" >> "$GITHUB_PATH"
+          echo "REPO=$GITHUB_WORKSPACE/git-repo/repo" >> $GITHUB_ENV
+
+      - name: Install dependencies & setup CCache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves
+          mkdir -p ~/.cache/bazel
+          ccache --max-size=2G
+          ccache --set-config=compression=true
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: Restore CCache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-ccache-${{ github.sha }}
+          restore-keys: |
+            ${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-ccache-
+
+      - name: Download toolchains & setup key
+        run: |
+          AOSP_MIRROR="https://android.googlesource.com"
+          BRANCH="main-kernel-build-2024"
+          git clone $AOSP_MIRROR/kernel/prebuilts/build-tools -b $BRANCH --depth 1 kernel-build-tools
+          git clone $AOSP_MIRROR/platform/system/tools/mkbootimg -b $BRANCH --depth 1 mkbootimg
+          
+          mkdir -p "$(dirname "$BOOT_SIGN_KEY_PATH")"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 > $BOOT_SIGN_KEY_PATH
+          git config --global user.name "build-user"
+          git config --global user.email "build-user@build-host"
+
+      # ==========================================
+      # 2. Fetch sources
+      # ==========================================
+      - name: Clone dependencies
+        run: |
+          SUSFS_BRANCH="gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}"
+          
+          git clone https://github.com/WildKernels/AnyKernel3.git -b "gki-2.0"
+          rm -rf AnyKernel3/.git
+
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
+          if [ -n "${SUSFS_COMMIT}" ]; then
+            git -C susfs4ksu checkout "$SUSFS_COMMIT"
+          fi
+
+          git clone https://github.com/WildKernels/kernel_patches.git
+          git clone https://github.com/ShirkNeko/SukiSU_patch.git
+
+      - name: Sync kernel source
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          git clone https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-gnu-6.4.1.git gcc
+          FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
+          $REPO init --depth=1 -u https://android.googlesource.com/kernel/manifest -b common-${FORMATTED_BRANCH} --repo-rev=v2.16
+
+          REMOTE_BRANCH=$(git ls-remote https://android.googlesource.com/kernel/common ${FORMATTED_BRANCH})
+          if grep -q "deprecated" <<< "$REMOTE_BRANCH"; then
+            sed -i "s/\"${FORMATTED_BRANCH}\"/\"deprecated\/${FORMATTED_BRANCH}\"/g" .repo/manifests/default.xml
+          fi
+          $REPO --trace sync -c -j$(nproc --all) --no-tags --fail-fast
+          cp "$DEFCONFIG" "$DEFCONFIG.orig"
+
+      # ==========================================
+      # 3. Patching & configuration
+      # ==========================================
+      - name: Apply stock config spoofing
+        run: |
+          STOCK_SRC="$GITHUB_WORKSPACE/config/stock_defconfig"
+          STOCK_DST="$KERNEL_ROOT/common/arch/arm64/configs/stock_defconfig"
+          TARGET_MAKEFILE="$KERNEL_ROOT/common/kernel/Makefile"
+          
+          if [ -f "$STOCK_SRC" ]; then
+            mkdir -p "$(dirname "$STOCK_DST")"
+            cp "$STOCK_SRC" "$STOCK_DST"
+            
+            OLD_RULE='$(obj)/config_data: $(KCONFIG_CONFIG) FORCE'
+            NEW_RULE='$(obj)/config_data: arch/arm64/configs/stock_defconfig FORCE'
+            if grep -qF "$OLD_RULE" "$TARGET_MAKEFILE"; then
+              sed -i "s|${OLD_RULE}|${NEW_RULE}|" "$TARGET_MAKEFILE"
+            fi
+          fi
+
+      - name: Fix glibc 2.38 compatibility
+        working-directory: ${{ env.KERNEL_ROOT }}/common
+        run: |
+          GLIBC_VERSION=$(ldd --version 2>/dev/null | head -n 1 | awk '{print $NF}')
+          if [ "$(printf '%s\n' "2.38" "$GLIBC_VERSION" | sort -V | head -n1)" = "2.38" ]; then
+            sed -i '/\$(Q)\$(MAKE) -C \$(SUBCMD_SRC) OUTPUT=\$(abspath \$(dir \$@))\/ \$(abspath \$@)/s//$(Q)$(MAKE) -C $(SUBCMD_SRC) EXTRA_CFLAGS="$(CFLAGS)" OUTPUT=$(abspath $(dir $@))\/ $(abspath $@)/' tools/bpf/resolve_btfids/Makefile || true
+            if [[ "${{ inputs.kernel_version }}" == "5.10" || "${{ inputs.kernel_version }}" == "5.15" ]]; then
+              sed -i -e '/char \*buf = NULL;/a int i;' -e 's/for (int i = 0; subcommands\[i\]; i++) {/for (i = 0; subcommands[i]; i++) {/' tools/lib/subcmd/parse-options.c || true
+            fi
+          fi
+
+      - name: Integrate KernelSU
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          if [ "${{ inputs.ksu_branch }}" == "Dev" ]; then
+            TARGET_BRANCH="dev"
+          else
+            TARGET_BRANCH="main"
+          fi
+
+          SUKI_ARGS="-s builtin"
+          if [ -n "${SUKISU_COMMIT}" ]; then
+            SUKI_ARGS="-s $SUKISU_COMMIT"
+          elif [ "${TARGET_BRANCH}" == "dev" ]; then
+            SUKI_ARGS="-s dev"
+          fi
+
+          case "${{ inputs.ksu_variant }}" in
+            "Official")
+              curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/$TARGET_BRANCH/kernel/setup.sh" | bash -s $TARGET_BRANCH
+              ;;
+            "SukiSU")
+              curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/$TARGET_BRANCH/kernel/setup.sh" | bash $SUKI_ARGS
+              ;;
+            "ReSukiSU")
+              curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/$TARGET_BRANCH/kernel/setup.sh" | bash $SUKI_ARGS
+              ;;
+          esac
+
+      - name: Apply SUSFS & minimal hooks
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          set -e
+          if [ "${{ inputs.enable_susfs }}" == "true" ]; then
+            cp $SUSFS4KSU/kernel_patches/50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch ./common/
+            cp $SUSFS4KSU/kernel_patches/fs/* ./common/fs/
+            cp $SUSFS4KSU/kernel_patches/include/linux/* ./common/include/linux/
+            
+            cd ./common
+            patch -p1 < 50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch
+            
+            if [[ "${{ inputs.android_version }}" == "android12" && "${{ inputs.kernel_version }}" == "5.10" ]]; then
+              [[ "${{ inputs.os_patch_level }}" == "2024-11" ]] && sed -i 's/vm_flags_clear(new_vma, VM_PAD_MASK);/new_vma->vm_flags \&= ~VM_PAD_MASK;/' ./mm/mmap.c || true
+              CURRENT_SUB=$(grep '^SUBLEVEL = ' Makefile | awk '{print $3}')
+              [[ ! "$CURRENT_SUB" =~ ^[0-9]+$ ]] && CURRENT_SUB=99999
+              if [ "$CURRENT_SUB" -le 209 ]; then
+                sed -i 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
+              fi
+            fi
+            cd ..
+          fi
+
+          [ -f "common/drivers/kernelsu/sulog/event.c" ] && sed -i 's/USER_ARG_NULL, gfp/\&USER_ARG_NULL, gfp/g' common/drivers/kernelsu/sulog/event.c || true
+          [ -f "common/fs/devpts/inode.c" ] && sed -i '/ksu_handle_devpts/d' common/fs/devpts/inode.c || true
+          [ -f "common/drivers/kernelsu/setuid_hook.c" ] && sed -i '/susfs_extra_works/d' common/drivers/kernelsu/setuid_hook.c || true
+          [ -f "common/drivers/kernelsu/ksu.c" ] && sed -i '/susfs_extra_works/d' common/drivers/kernelsu/ksu.c || true
+
+          if [ -f "common/drivers/kernelsu/ksu.c" ]; then
+            cat >> common/drivers/kernelsu/ksu.c << 'EOF'
+          #include <linux/jump_label.h>
+          DEFINE_STATIC_KEY_FALSE(ksu_init_rc_hook_key_false); EXPORT_SYMBOL(ksu_init_rc_hook_key_false);
+          DEFINE_STATIC_KEY_FALSE(ksu_input_hook_key_false); EXPORT_SYMBOL(ksu_input_hook_key_false);
+          bool ksu_is_init_rc_hook_enabled(void) { return static_branch_unlikely(&ksu_init_rc_hook_key_false); } EXPORT_SYMBOL(ksu_is_init_rc_hook_enabled);
+          bool ksu_is_input_hook_enabled(void) { return static_branch_unlikely(&ksu_input_hook_key_false); } EXPORT_SYMBOL(ksu_is_input_hook_enabled);
+          EOF
+          fi
+
+          if [ -f "common/security/selinux/hooks.c" ]; then
+            cat >> common/security/selinux/hooks.c << 'EOF'
+          bool ksu_selinux_hide_running = false;
+          struct selinux_state fake_state;
+          EOF
+          fi
+
+      - name: Inject kernel configs
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          cat >> "$DEFCONFIG" << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_SECURITY_SELINUX_DEVELOP=y
+          EOF
+
+          [ "${{ inputs.enable_kpm }}" == "true" ] && echo "CONFIG_KPM=y" >> "$DEFCONFIG" || echo "# CONFIG_KPM is not set" >> "$DEFCONFIG"
+
+          if [ "${{ inputs.enable_susfs }}" == "true" ]; then
+            cat >> "$DEFCONFIG" << 'EOF'
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_KSU_SUSFS_SUS_SU=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          EOF
+            [ "${{ inputs.enable_susfs_log }}" == "true" ] && echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG" || echo "CONFIG_KSU_SUSFS_ENABLE_LOG=n" >> "$DEFCONFIG"
+          fi
+          sed -i 's/check_defconfig//' ./common/build.config.gki
+
+      - name: Setup custom info
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            sed -i '$s|echo "\$res"|echo "${{ inputs.version }}"|' ./common/scripts/setlocalversion
+            sed -i '/^CONFIG_LOCALVERSION=/ s/="\([^"]*\)"/="${{ inputs.version }}"/' ./common/arch/arm64/configs/gki_defconfig || true
+          fi
+
+          if [ -n "${{ inputs.build_time }}" ]; then
+            CURRENT_TIME="${{ inputs.build_time }}"
+            EPOCH_TIME=$(date -d "$CURRENT_TIME" +"%s" 2>/dev/null || date +"%s")
+          else
+            CURRENT_TIME=$(date -u +"%a %b %d %H:%M:%S UTC %Y")
+            EPOCH_TIME=$(date +"%s")
+          fi
+
+          echo "KBUILD_BUILD_TIMESTAMP=$CURRENT_TIME" >> $GITHUB_ENV
+          echo "SOURCE_DATE_EPOCH=$EPOCH_TIME" >> $GITHUB_ENV
+
+          f="./common/scripts/mkcompile_h"
+          if [ -f "$f" ]; then
+            if grep -q 'echo \\#define UTS_VERSION' "$f"; then
+              sed -i 's/^echo \\#define UTS_VERSION.*/echo \\#define UTS_VERSION \\"#1 SMP PREEMPT '"$CURRENT_TIME"'\\"/g' "$f"
+            elif grep -q 'UTS_VERSION=' "$f"; then
+              sed -i 's/^UTS_VERSION=.*/UTS_VERSION="#1 SMP PREEMPT '"$CURRENT_TIME"'"/g' "$f"
+            else
+              perl -0777 -pi -e "s{cat <<EOF}{cat <<EOF\n#undef UTS_VERSION\n#define UTS_VERSION \"#1 SMP PREEMPT $CURRENT_TIME\" } unless /UTS_VERSION/" "$f"
+            fi
+          fi
+
+      # ==========================================
+      # 4. Compilation & packing
+      # ==========================================
+      - name: Build kernel
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 30
+          max_attempts: 3
+          retry_on: timeout
+          command: |
+            set -ex
+            cd "$KERNEL_ROOT"
+            sed -i -e 's/BUILD_SYSTEM_DLKM=1/BUILD_SYSTEM_DLKM=0/' -e '/MODULES_ORDER=android\/gki_aarch64_modules/d' -e '/KMI_SYMBOL_LIST_STRICT_MODE/d' ./common/build.config.gki.aarch64
+
+            if [ -f "build/build.sh" ]; then
+              LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 KBUILD_BUILD_TIMESTAMP="$KBUILD_BUILD_TIMESTAMP" SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" KBUILD_BUILD_USER="$KBUILD_BUILD_USER" KBUILD_BUILD_HOST="$KBUILD_BUILD_HOST" build/build.sh CC="/usr/bin/ccache clang" || exit 1
+            else
+              FRAG="common/arch/arm64/configs/ksu.fragment"
+              diff "$DEFCONFIG.orig" "$DEFCONFIG" | grep '^>' | sed 's/^> //; s/^[[:space:]]*//' > "$FRAG" || true
+              cp "$DEFCONFIG.orig" "$DEFCONFIG"
+              FRAG_FLAG=$([ -s "$FRAG" ] && echo "--defconfig_fragment=//common:arch/arm64/configs/ksu.fragment" || echo "")
+              LTO_FLAG=$([ "${{ inputs.kernel_version }}" = "6.12" ] && echo "--lto=none" || echo "--lto=thin")
+              
+              tools/bazel build \
+                --action_env=KBUILD_BUILD_TIMESTAMP="$KBUILD_BUILD_TIMESTAMP" \
+                --action_env=SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+                --action_env=KBUILD_BUILD_USER="$KBUILD_BUILD_USER" \
+                --action_env=KBUILD_BUILD_HOST="$KBUILD_BUILD_HOST" \
+                --disk_cache=/home/runner/.cache/bazel \
+                --config=fast $LTO_FLAG $FRAG_FLAG //common:kernel_aarch64_dist || exit 1
+            fi
+
+      - name: Apply KPM patch
+        if: inputs.enable_kpm == true && (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'ReSukiSU')
+        run: |
+          if [[ "${{ inputs.android_version }}" =~ android1[23] && "${{ inputs.kernel_version }}" != "6.6" ]]; then
+            TARGET_PATH="$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist"
+          else
+            TARGET_PATH="$KERNEL_ROOT/bazel-bin/common/kernel_aarch64/"
+          fi
+          cp -r $SUKISU_PATCHES/kpm/patch_linux "$TARGET_PATH/patch"
+          cd "$TARGET_PATH" && chmod 777 patch && ./patch && rm -rf Image && mv oImage Image
+
+      - name: Pack AnyKernel3 & boot images
+        run: |
+          FILE_NAME="TX-${{ inputs.ksu_variant }}"
+          if [ "${{ inputs.enable_susfs }}" == "true" ]; then FILE_NAME="${FILE_NAME}-SUSFS"; fi
+          if [ "${{ inputs.enable_kpm }}" == "true" ]; then FILE_NAME="${FILE_NAME}-KPM"; fi
+          FILE_NAME="${FILE_NAME}-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.revision }}"
+          echo "ARTIFACT_NAME=$FILE_NAME" >> $GITHUB_ENV
+
+          mkdir -p bootimgs
+          if [[ "${{ inputs.android_version }}" =~ android1[23] && "${{ inputs.kernel_version }}" != "6.6" ]]; then
+            SRC_DIR="$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist"
+          else
+            SRC_DIR="$KERNEL_ROOT/bazel-bin/common/kernel_aarch64"
+          fi
+          
+          cp "$SRC_DIR/Image" "$SRC_DIR/Image.lz4" ./bootimgs/
+          cp "$SRC_DIR/Image" "$ANYKERNEL3/"
+
+          cd $ANYKERNEL3
+          zip -r "../${FILE_NAME}-AnyKernel3.zip" ./*
+          cd ..
+
+          cd bootimgs
+          if [ "${{ inputs.android_version }}" == "android12" ]; then
+            GKI_URL="https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-${{ inputs.os_patch_level }}_${{ inputs.revision }}.zip"
+            FALLBACK_URL="https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-2023-01_r1.zip"
+            if curl -sL -w "%{http_code}" "$GKI_URL" -o /dev/null | grep -q "200"; then
+              curl -Lo gki-kernel.zip "$GKI_URL"
+            else
+              curl -Lo gki-kernel.zip "$FALLBACK_URL"
+            fi
+            unzip gki-kernel.zip && rm gki-kernel.zip
+            $UNPACK_BOOTIMG --boot_img="$(pwd)/boot-5.10.img"
+          fi
+
+          gzip -n -k -f -9 ./Image > ./Image.gz
+          for TYPE in "Image:boot.img" "Image.gz:boot-gz.img" "Image.lz4:boot-lz4.img"; do
+            IMG_SRC="${TYPE%%:*}"
+            IMG_DST="${TYPE##*:}"
+            if [ "${{ inputs.android_version }}" == "android12" ]; then
+              $MKBOOTIMG --header_version 4 --kernel "$IMG_SRC" --output "$IMG_DST" --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
+            else
+              $MKBOOTIMG --header_version 4 --kernel "$IMG_SRC" --output "$IMG_DST"
+            fi
+            $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image "$IMG_DST" --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
+            cp "./$IMG_DST" "../${FILE_NAME}-$IMG_DST"
+          done
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            *AnyKernel3.zip
+            *.img
+          compression-level: 9
